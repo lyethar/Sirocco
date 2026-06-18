@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Engagement output / sensitive data — NEVER publish these.
+# ---------------------------------------------------------------------------
+logs/
+*.log
+AccessTokens.json
+
+# Spray output artifacts (in case they land outside logs/)
+spray_attempts_*.csv
+spray_run_*.log
+valid_creds_*.txt
+fireprox_endpoints_*.txt
+refinery_removed_*.txt
+mfa_results_*.csv
+mfa_raw_*.log
+userlist_backup_*.txt
+
+# Input wordlists / target data
+users.txt
+usernames.txt
+passwords.txt
+password.txt
+*.userlist
+*.passlist
+
+# ---------------------------------------------------------------------------
+# Credentials / secrets
+# ---------------------------------------------------------------------------
+.aws/
+credentials
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/
