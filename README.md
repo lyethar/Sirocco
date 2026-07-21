@@ -30,6 +30,12 @@ which is kept in `MSOLSpray/MSOLSpray.ps1` as the reference implementation.
   credential is immediately run through [MFASweep](https://github.com/dafthack/MFASweep)
   to identify which Microsoft services allow single-factor (no-MFA) access. The
   sweep runs non-interactively and its results are logged per credential.
+- **MFA / conditional-access gap audit** — with `-AccessAudit`, every *successful*
+  credential is run through a [FindMeAccess](https://github.com/absolomb/FindMeAccess)-style
+  audit that sweeps **resource × client-id × user-agent** combinations to find
+  which grant single-factor (no-MFA / no-conditional-access) access. Ported
+  natively to PowerShell and routed **through FireProx** (IP rotation for the
+  audit traffic too). Results logged per combination.
 - **Lockout-aware result parsing** — distinguishes valid creds, MFA, conditional
   access, expired passwords, locked, disabled, invalid user, and invalid tenant
   via AADSTS error codes.
@@ -49,6 +55,8 @@ which is kept in `MSOLSpray/MSOLSpray.ps1` as the reference implementation.
   (used by FireProx).
 - *(Optional)* **MFASweep** (https://github.com/dafthack/MFASweep) — supply its
   `MFASweep.ps1` path via `-MFASweepPath` to enable the per-success MFA sweep.
+- The **access audit** (`-AccessAudit`) needs no external tool — the
+  FindMeAccess logic is built into Sirocco.
 
 ---
 
@@ -62,6 +70,7 @@ which is kept in `MSOLSpray/MSOLSpray.ps1` as the reference implementation.
 | `fireprox_endpoints_<stamp>.txt` | Every FireProx endpoint created (`time, api_id, url`) — for cleanup. |
 | `mfa_results_<stamp>.csv` | MFA sweep results: `Timestamp, Username, Password, Service, SingleFactorAccess` (one row per service per successful cred). |
 | `mfa_raw_<stamp>.log` | Full raw MFASweep console output, captured per credential. |
+| `access_audit_<stamp>.csv` | Access-audit results: `Timestamp, Username, Password, Resource, ClientId, UserAgent, Status, Detail` (one row per combination). |
 | `refinery_removed_<stamp>.txt` | Users pruned by the refinery and why. |
 | `userlist_backup_<stamp>.txt`  | One-time backup of your original user list (refinery rewrites it in place). |
 
@@ -109,6 +118,22 @@ which is kept in `MSOLSpray/MSOLSpray.ps1` as the reference implementation.
     -MFASweepPath /path/to/MFASweep/MFASweep.ps1 -IncludeADFS
 ```
 
+### With an MFA / conditional-access gap audit
+
+```powershell
+# Full built-in matrix (all resources x all clients, single UA)
+.\Sirocco.ps1 -UserListPath .\users.txt -PasswordListPath .\passwords.txt `
+    -FireProxPath /path/to/fireprox/fire.py `
+    -AwsProfile myprofile -AccessKey "AKIA..." -SecretAccessKey "xxxxx" `
+    -AccessAudit
+
+# Scoped by a config file (see audit.conf.example)
+.\Sirocco.ps1 -UserListPath .\users.txt -PasswordListPath .\passwords.txt `
+    -FireProxPath /path/to/fireprox/fire.py `
+    -AwsProfile myprofile -AccessKey "AKIA..." -SecretAccessKey "xxxxx" `
+    -AccessAudit -AuditConfig .\audit.conf
+```
+
 ---
 
 ## Parameters
@@ -131,6 +156,13 @@ which is kept in `MSOLSpray/MSOLSpray.ps1` as the reference implementation.
 | `-RefineTenants` | *(off)* | Also prune users whose **tenant** doesn't exist. |
 | `-MFASweepPath` | `""` | Path to `MFASweep.ps1`. When set, runs an MFA sweep after each successful spray. |
 | `-IncludeADFS` | *(off)* | Include the on-prem ADFS login attempt in the MFA sweep. |
+| `-AccessAudit` | *(off)* | Run the FindMeAccess-style MFA/CA gap audit on each successful credential. |
+| `-AuditAllUserAgents` | *(off)* | Sweep every built-in user agent (large matrix). Default: one UA. |
+| `-AuditResource` | `""` | Limit the audit to one resource (built-in name or raw URL). |
+| `-AuditClient` | `""` | Limit the audit to one client (built-in name or GUID). |
+| `-AuditUserAgent` | `""` | Use a specific user agent (built-in name or raw string). |
+| `-AuditConfig` | `""` | Config file restricting the audit matrix (mutually exclusive with the four filters above). |
+| `-AuditDelayMs` | `0` | Delay in ms between audit requests (throttle). |
 
 ---
 
@@ -185,6 +217,45 @@ was possible:
 
 ---
 
+## How the access audit works
+
+`-AccessAudit` ports the logic of [FindMeAccess](https://github.com/absolomb/FindMeAccess)
+into Sirocco. For each credential confirmed valid during the spray, it sweeps a
+matrix of **resource × client-id × user-agent**, sending a password-grant request
+for each combination to the token endpoint **through the current FireProx
+endpoint** (so the audit traffic rotates IPs like the spray does, and honours the
+same 403/Forbidden rotation).
+
+Each combination is classified from the response:
+
+- **HTTP 200 → `NO-MFA`** — that resource is reachable with that client/UA using
+  only the password (single-factor); the granted token scope is recorded.
+- `AADSTS50079` → `NO-MFA (enrollment req, not configured)` — also a gap.
+- `AADSTS50076` → `MFA-REQUIRED`, `AADSTS53003`/`50105` → `CA-BLOCKED`,
+  `AADSTS53000` → `COMPLIANT-DEVICE`, `AADSTS50158` → `THIRD-PARTY-MFA`, plus
+  consent / client-authorization / disabled-app / risk classifications.
+
+Outputs:
+
+- `access_audit_<stamp>.csv` — one row per combination
+  (`Timestamp, Username, Password, Resource, ClientId, UserAgent, Status, Detail`).
+- Each `NO-MFA` hit is echoed to the run log, and a per-credential summary lists
+  the distinct resources reachable without MFA.
+
+**Scoping the matrix.** The full built-in set is **19 resources × 60 clients**.
+By default the audit uses a single user agent (Windows 10 Chrome), so a full run
+is ~1,140 requests per valid credential. Narrow it with `-AuditResource`,
+`-AuditClient`, `-AuditUserAgent`, or an `-AuditConfig` file (see
+[`audit.conf.example`](audit.conf.example)). `-AuditAllUserAgents` expands the
+matrix across all nine user agents (~10k requests) — use sparingly.
+
+> **Note:** these requests all use the *correct* password, so they don't count
+> toward failed-login lockout — but a large audit can generate risk/impossible-
+> travel signals. Use `-AuditDelayMs` to throttle, and scope with a config file
+> on sensitive tenants.
+
+---
+
 ## Cleaning up FireProx endpoints
 
 Every endpoint Sirocco creates is recorded in
@@ -216,4 +287,5 @@ python3 fire.py --access_key "AKIA..." --secret_access_key "xxxxx" \
 
 - Spray technique & AADSTS handling: [MSOLSpray](https://github.com/dafthack/MSOLSpray) — Beau Bullock (@dafthack), BSD-3-Clause.
 - MFA sweep logic: [MFASweep](https://github.com/dafthack/MFASweep) — Beau Bullock (@dafthack), MIT.
+- MFA/conditional-access gap audit: [FindMeAccess](https://github.com/absolomb/FindMeAccess) — (@absolomb).
 - IP rotation: [FireProx](https://github.com/ustayready/fireprox) — Mike Felch (@ustayready).

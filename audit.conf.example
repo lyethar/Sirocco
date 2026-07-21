@@ -1,0 +1,25 @@
+# Sirocco access-audit config (FindMeAccess-compatible).
+# Restricts the -AccessAudit matrix to just these entries.
+# Each line under a section may be a built-in NAME or a raw value
+# (resource URL / client GUID / user-agent string). Unknown values are
+# treated as custom entries. Omit a section to use all built-ins for it.
+#
+# Usage:
+#   .\Sirocco.ps1 ... -AccessAudit -AuditConfig .\audit.conf
+
+[resources]
+Azure Graph API
+Microsoft Graph API
+Azure Management API
+Outlook
+
+[clients]
+Microsoft Azure PowerShell
+Microsoft Azure CLI
+Microsoft Office
+Microsoft Authentication Broker
+
+[user_agents]
+Windows 10 Chrome
+Android Chrome
+iPhone Safari
